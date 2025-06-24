@@ -316,6 +316,300 @@ def fix_uv_coordinates(uv_coords):
 
     return fixed_uv
 
+def analyze_mesh_structure(vertices, faces):
+    """分析网格结构，识别主要部位"""
+    print("🔍 分析网格结构和语义部位")
+
+    center = vertices.mean(axis=0)
+    centered = vertices - center
+
+    # 计算每个顶点到中心的距离
+    distances = np.linalg.norm(centered, axis=1)
+
+    # 计算主轴方向
+    cov_matrix = np.cov(centered.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+    idx = np.argsort(eigenvalues)[::-1]
+    main_axes = eigenvectors[:, idx]
+
+    # 定义主要方向
+    primary_axis = main_axes[:, 0]  # 主轴（通常是身体长轴）
+    secondary_axis = main_axes[:, 1]  # 次轴（通常是宽度方向）
+    tertiary_axis = main_axes[:, 2]  # 第三轴（通常是厚度方向）
+
+    # 计算顶点在各个轴上的投影
+    primary_proj = np.dot(centered, primary_axis)
+    secondary_proj = np.dot(centered, secondary_axis)
+    tertiary_proj = np.dot(centered, tertiary_axis)
+
+    # 识别前后、左右、上下
+    front_back_axis = primary_axis
+    left_right_axis = secondary_axis
+    up_down_axis = tertiary_axis
+
+    # 确定正方向（假设模型面向+X方向）
+    if abs(primary_axis[0]) > abs(primary_axis[2]):
+        front_back_axis = primary_axis
+        up_down_axis = tertiary_axis
+    else:
+        front_back_axis = tertiary_axis
+        up_down_axis = primary_axis
+
+    return {
+        'center': center,
+        'main_axes': main_axes,
+        'front_back_axis': front_back_axis,
+        'left_right_axis': left_right_axis,
+        'up_down_axis': up_down_axis,
+        'primary_proj': primary_proj,
+        'secondary_proj': secondary_proj,
+        'tertiary_proj': tertiary_proj,
+        'distances': distances
+    }
+
+def segment_mesh_by_regions(vertices, faces, structure_info):
+    """将网格分割为语义区域"""
+    print("🎯 分割网格为语义区域")
+
+    center = structure_info['center']
+    centered = vertices - center
+
+    # 计算各轴投影
+    front_back_proj = np.dot(centered, structure_info['front_back_axis'])
+    left_right_proj = np.dot(centered, structure_info['left_right_axis'])
+    up_down_proj = np.dot(centered, structure_info['up_down_axis'])
+
+    # 标准化投影值
+    fb_norm = (front_back_proj - front_back_proj.min()) / (front_back_proj.max() - front_back_proj.min() + 1e-8)
+    lr_norm = (left_right_proj - left_right_proj.min()) / (left_right_proj.max() - left_right_proj.min() + 1e-8)
+    ud_norm = (up_down_proj - up_down_proj.min()) / (up_down_proj.max() - up_down_proj.min() + 1e-8)
+
+    # 定义区域
+    regions = {}
+
+    # 前面区域（脸部、胸部）
+    front_mask = fb_norm > 0.6
+    regions['front'] = front_mask
+
+    # 后面区域（背部）
+    back_mask = fb_norm < 0.4
+    regions['back'] = back_mask
+
+    # 侧面区域
+    left_mask = (lr_norm < 0.3) & (~front_mask) & (~back_mask)
+    right_mask = (lr_norm > 0.7) & (~front_mask) & (~back_mask)
+    regions['left'] = left_mask
+    regions['right'] = right_mask
+
+    # 顶部区域（头部）
+    top_mask = ud_norm > 0.7
+    regions['top'] = top_mask
+
+    # 底部区域（脚部）
+    bottom_mask = ud_norm < 0.3
+    regions['bottom'] = bottom_mask
+
+    # 中间区域
+    middle_mask = ~(front_mask | back_mask | left_mask | right_mask | top_mask | bottom_mask)
+    regions['middle'] = middle_mask
+
+    print(f"区域分割结果:")
+    for region_name, mask in regions.items():
+        count = np.sum(mask)
+        percentage = count / len(vertices) * 100
+        print(f"  {region_name}: {count} 顶点 ({percentage:.1f}%)")
+
+    return regions
+
+def semantic_uv_mapping(vertices, faces, original_image, structure_info, regions):
+    """基于语义的UV映射"""
+    print("🧠 执行语义感知UV映射")
+
+    uv_coords = np.zeros((len(vertices), 2))
+
+    # 为不同区域分配不同的UV空间
+    uv_regions = {
+        'front': (0.0, 0.5, 0.0, 1.0),    # 左半部分
+        'back': (0.5, 1.0, 0.0, 1.0),     # 右半部分
+        'top': (0.0, 0.5, 0.0, 0.5),      # 左上
+        'bottom': (0.0, 0.5, 0.5, 1.0),   # 左下
+        'left': (0.5, 0.75, 0.0, 0.5),    # 右上左
+        'right': (0.75, 1.0, 0.0, 0.5),   # 右上右
+        'middle': (0.5, 1.0, 0.5, 1.0)    # 右下
+    }
+
+    center = structure_info['center']
+    centered = vertices - center
+
+    for region_name, mask in regions.items():
+        if not np.any(mask):
+            continue
+
+        region_vertices = vertices[mask]
+        region_centered = region_vertices - center
+
+        # 获取该区域的UV空间范围
+        u_min, u_max, v_min, v_max = uv_regions.get(region_name, (0, 1, 0, 1))
+
+        if region_name in ['front', 'back']:
+            # 前后面使用改进的平面投影
+            if region_name == 'front':
+                # 前面：投影到YZ平面
+                u_coord = np.dot(region_centered, structure_info['left_right_axis'])
+                v_coord = np.dot(region_centered, structure_info['up_down_axis'])
+            else:
+                # 后面：投影到YZ平面，但翻转U坐标
+                u_coord = -np.dot(region_centered, structure_info['left_right_axis'])
+                v_coord = np.dot(region_centered, structure_info['up_down_axis'])
+
+        elif region_name in ['left', 'right']:
+            # 侧面使用柱面投影
+            if region_name == 'left':
+                u_coord = np.dot(region_centered, structure_info['front_back_axis'])
+                v_coord = np.dot(region_centered, structure_info['up_down_axis'])
+            else:
+                u_coord = -np.dot(region_centered, structure_info['front_back_axis'])
+                v_coord = np.dot(region_centered, structure_info['up_down_axis'])
+
+        elif region_name in ['top', 'bottom']:
+            # 顶部和底部使用平面投影
+            u_coord = np.dot(region_centered, structure_info['left_right_axis'])
+            v_coord = np.dot(region_centered, structure_info['front_back_axis'])
+
+        else:  # middle
+            # 中间区域使用球面投影
+            x, y, z = region_centered[:, 0], region_centered[:, 1], region_centered[:, 2]
+            r = np.linalg.norm(region_centered, axis=1) + 1e-8
+            theta = np.arctan2(y, x)
+            phi = np.arccos(np.clip(z / r, -1, 1))
+            u_coord = (theta + np.pi) / (2 * np.pi)
+            v_coord = phi / np.pi
+
+        # 标准化到区域UV空间
+        if len(u_coord) > 0:
+            u_range = u_coord.max() - u_coord.min()
+            v_range = v_coord.max() - v_coord.min()
+
+            if u_range > 1e-8:
+                u_norm = (u_coord - u_coord.min()) / u_range
+            else:
+                u_norm = np.full_like(u_coord, 0.5)
+
+            if v_range > 1e-8:
+                v_norm = (v_coord - v_coord.min()) / v_range
+            else:
+                v_norm = np.full_like(v_coord, 0.5)
+
+            # 映射到分配的UV区域
+            u_final = u_min + u_norm * (u_max - u_min)
+            v_final = v_min + v_norm * (v_max - v_min)
+
+            uv_coords[mask, 0] = u_final
+            uv_coords[mask, 1] = v_final
+
+    return uv_coords
+
+def create_semantic_texture(original_image, regions_info, texture_size=1024):
+    """创建语义感知的纹理布局"""
+    print("🎨 创建语义感知纹理布局")
+
+    # 创建纹理画布
+    texture = np.ones((texture_size, texture_size, 3), dtype=np.uint8) * 128
+
+    if isinstance(original_image, str):
+        img = Image.open(original_image)
+    else:
+        img = original_image
+
+    # 确保图像是RGB格式
+    if img.mode == 'RGBA':
+        img = img.convert('RGB')
+    elif img.mode != 'RGB':
+        img = img.convert('RGB')
+
+    img_array = np.array(img)
+
+    # 定义不同区域的纹理处理
+    region_configs = {
+        'front': {
+            'area': (0, texture_size//2, 0, texture_size),
+            'source_area': (0.2, 0.8, 0.1, 0.9),  # 主要面部/胸部区域
+            'enhancement': 'face'
+        },
+        'back': {
+            'area': (texture_size//2, texture_size, 0, texture_size),
+            'source_area': (0.1, 0.9, 0.2, 0.8),  # 背部区域
+            'enhancement': 'body'
+        },
+        'top': {
+            'area': (0, texture_size//2, 0, texture_size//2),
+            'source_area': (0.3, 0.7, 0.0, 0.4),  # 头部区域
+            'enhancement': 'head'
+        },
+        'bottom': {
+            'area': (0, texture_size//2, texture_size//2, texture_size),
+            'source_area': (0.3, 0.7, 0.6, 1.0),  # 脚部区域
+            'enhancement': 'feet'
+        }
+    }
+
+    for region_name, config in region_configs.items():
+        # 获取目标区域
+        y1, y2, x1, x2 = config['area']
+
+        # 获取源图像区域
+        sy1, sy2, sx1, sx2 = config['source_area']
+        src_y1 = int(sy1 * img_array.shape[0])
+        src_y2 = int(sy2 * img_array.shape[0])
+        src_x1 = int(sx1 * img_array.shape[1])
+        src_x2 = int(sx2 * img_array.shape[1])
+
+        # 提取并调整源区域
+        src_region = img_array[src_y1:src_y2, src_x1:src_x2]
+
+        if src_region.size > 0:
+            # 调整大小到目标区域
+            target_h, target_w = y2 - y1, x2 - x1
+            resized_region = cv2.resize(src_region, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+
+            # 根据区域类型进行增强
+            if config['enhancement'] == 'face':
+                # 面部区域：增强细节
+                resized_region = enhance_face_region(resized_region)
+            elif config['enhancement'] == 'head':
+                # 头部区域：保持原色调
+                resized_region = enhance_head_region(resized_region)
+            elif config['enhancement'] == 'body':
+                # 身体区域：柔化处理
+                resized_region = enhance_body_region(resized_region)
+
+            # 应用到纹理
+            texture[y1:y2, x1:x2] = resized_region
+
+    return Image.fromarray(texture)
+
+def enhance_face_region(region):
+    """增强面部区域"""
+    # 增强对比度和锐度
+    enhanced = cv2.convertScaleAbs(region, alpha=1.1, beta=5)
+    # 轻微锐化
+    kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+    enhanced = cv2.filter2D(enhanced, -1, kernel * 0.1 + np.eye(3) * 0.9)
+    return enhanced
+
+def enhance_head_region(region):
+    """增强头部区域"""
+    # 保持自然色调，轻微增强
+    enhanced = cv2.convertScaleAbs(region, alpha=1.05, beta=2)
+    return enhanced
+
+def enhance_body_region(region):
+    """增强身体区域"""
+    # 柔化处理
+    enhanced = cv2.GaussianBlur(region, (3, 3), 0.5)
+    enhanced = cv2.convertScaleAbs(enhanced, alpha=0.95, beta=0)
+    return enhanced
+
 def create_enhanced_texture(original_image, texture_size=1024, style='realistic'):
     """创建增强纹理"""
     print(f"🎨 创建增强纹理 (风格: {style}, 尺寸: {texture_size})")
@@ -477,8 +771,8 @@ def main():
     parser.add_argument("--mesh", type=str, required=True, help="输入3D网格文件")
     parser.add_argument("--image", type=str, help="纹理图像文件")
     parser.add_argument("--output", type=str, default="textured_output.glb", help="输出文件")
-    parser.add_argument("--projection", choices=['smart', 'spherical', 'cylindrical', 'planar_z', 'planar_y', 'planar_x', 'planar_auto', 'conformal'],
-                       default='smart', help="UV投影方法")
+    parser.add_argument("--projection", choices=['semantic', 'smart', 'spherical', 'cylindrical', 'planar_z', 'planar_y', 'planar_x', 'planar_auto', 'conformal'],
+                       default='semantic', help="UV投影方法")
     parser.add_argument("--texture-size", type=int, default=1024, help="纹理分辨率")
     parser.add_argument("--style", choices=['realistic', 'artistic', 'vintage', 'cartoon'], 
                        default='realistic', help="纹理风格")
@@ -493,7 +787,20 @@ def main():
         mesh = load_mesh(args.mesh)
         
         # 选择UV投影方法
-        if args.projection == 'smart':
+        if args.projection == 'semantic':
+            # 语义感知UV映射
+            structure_info = analyze_mesh_structure(mesh.vertices, mesh.faces)
+            regions = segment_mesh_by_regions(mesh.vertices, mesh.faces, structure_info)
+            uv_coords = semantic_uv_mapping(mesh.vertices, mesh.faces, args.image, structure_info, regions)
+
+            # 使用语义感知纹理
+            if args.image:
+                texture_image = create_semantic_texture(args.image, regions, args.texture_size)
+            else:
+                print("⚠️ 语义映射需要输入图像")
+                return False
+
+        elif args.projection == 'smart':
             uv_coords = smart_uv_projection(mesh.vertices)
         elif args.projection == 'spherical':
             uv_coords = spherical_projection(mesh.vertices)
@@ -517,14 +824,15 @@ def main():
             uv_coords = fix_uv_coordinates(uv_coords)
             print("✅ UV坐标修复完成")
 
-        # 创建纹理
-        if args.procedural:
-            texture_image = create_procedural_texture(args.texture_size, args.procedural)
-        elif args.image:
-            texture_image = create_enhanced_texture(args.image, args.texture_size, args.style)
-        else:
-            print("❌ 请提供纹理图像或选择程序化纹理")
-            return False
+        # 创建纹理（如果还没有创建）
+        if args.projection != 'semantic':
+            if args.procedural:
+                texture_image = create_procedural_texture(args.texture_size, args.procedural)
+            elif args.image:
+                texture_image = create_enhanced_texture(args.image, args.texture_size, args.style)
+            else:
+                print("❌ 请提供纹理图像或选择程序化纹理")
+                return False
         
         # 应用纹理
         textured_mesh = apply_advanced_texture(mesh, uv_coords, texture_image, args.material)
